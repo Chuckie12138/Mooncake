@@ -4,11 +4,14 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <ranges>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
@@ -152,6 +155,86 @@ class StorageBackendTest : public ::testing::Test {
     }
 };
 
+namespace {
+
+class MockDistributedKVClient : public DistributedKVClient {
+   public:
+    tl::expected<void, ErrorCode> BatchPut(
+        const std::vector<std::string>& keys,
+        const std::vector<std::string>& values) override {
+        if (keys.size() != values.size()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            kv_[keys[i]] = values[i];
+        }
+        return {};
+    }
+
+    tl::expected<std::vector<std::string>, ErrorCode> BatchGet(
+        const std::vector<std::string>& keys) override {
+        std::vector<std::string> values;
+        values.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto it = kv_.find(key);
+            if (it == kv_.end()) {
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
+            values.push_back(it->second);
+        }
+        return values;
+    }
+
+    tl::expected<std::vector<bool>, ErrorCode> BatchExist(
+        const std::vector<std::string>& keys) override {
+        std::vector<bool> values;
+        values.reserve(keys.size());
+        for (const auto& key : keys) {
+            values.push_back(kv_.contains(key));
+        }
+        return values;
+    }
+
+    tl::expected<std::vector<std::pair<std::string, uint64_t>>, ErrorCode>
+    ListKeysByOwner(const std::string& owner_node_id) override {
+        std::vector<std::pair<std::string, uint64_t>> result;
+        constexpr std::string_view kMetaMarker = ":meta:";
+        for (const auto& [key, value] : kv_) {
+            auto pos = key.find(kMetaMarker);
+            if (pos == std::string::npos) {
+                continue;
+            }
+            auto sep = value.find('|');
+            if (sep == std::string::npos) {
+                continue;
+            }
+            if (value.substr(0, sep) != owner_node_id) {
+                continue;
+            }
+            uint64_t size_bytes = std::stoull(value.substr(sep + 1));
+            result.emplace_back(key.substr(pos + kMetaMarker.size()),
+                                size_bytes);
+        }
+        return result;
+    }
+
+    tl::expected<bool, ErrorCode> IsHealthy() override { return true; }
+
+   private:
+    std::unordered_map<std::string, std::string> kv_;
+};
+
+std::vector<Slice> MakeSlices(const std::string& value,
+                              std::vector<std::unique_ptr<char[]>>& buffers) {
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+    auto* raw = buf.get();
+    buffers.push_back(std::move(buf));
+    return {Slice{raw, value.size()}};
+}
+
+}  // namespace
+
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
@@ -207,6 +290,135 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
         ASSERT_EQ(data, test_data_it.second);
         delete[] buf;
     }
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackendBasicReadWrite) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    DistributedKVBackendConfig dkv_config;
+    dkv_config.kv_endpoint = "mock://kv";
+    dkv_config.kv_namespace_ = "unit";
+    dkv_config.owner_node_id =
+        "123e4567-e89b-12d3-a456-426614174000";
+
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    DistributedKVStorageBackend backend(config, dkv_config);
+    backend.SetKVClient(mock_client);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace("key_a", MakeSlices("value_a", buffers));
+    batch.emplace("key_b", MakeSlices("value_b", buffers));
+
+    auto offload_res = backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res.has_value());
+    EXPECT_EQ(offload_res.value(), 2);
+
+    auto exists_a = backend.IsExist("key_a");
+    ASSERT_TRUE(exists_a.has_value());
+    EXPECT_TRUE(exists_a.value());
+
+    std::string load_a(7, '\0');
+    std::string load_b(7, '\0');
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace("key_a", Slice{load_a.data(), load_a.size()});
+    load_batch.emplace("key_b", Slice{load_b.data(), load_b.size()});
+    ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(load_a, "value_a");
+    EXPECT_EQ(load_b, "value_b");
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackendScanMetaRestoresOwnerKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.scanmeta_iterator_keys_limit = 1;
+    DistributedKVBackendConfig dkv_config;
+    dkv_config.kv_endpoint = "mock://kv";
+    dkv_config.kv_namespace_ = "unit";
+    dkv_config.owner_node_id =
+        "123e4567-e89b-12d3-a456-426614174000";
+
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    ASSERT_TRUE(mock_client
+                    ->BatchPut({"mooncake:unit:meta:key_a",
+                                "mooncake:unit:meta:key_b"},
+                               {"123e4567-e89b-12d3-a456-426614174000|7",
+                                "ffffffff-ffff-ffff-ffff-ffffffffffff|9"})
+                    .has_value());
+
+    DistributedKVStorageBackend backend(config, dkv_config);
+    backend.SetKVClient(mock_client);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    std::vector<std::string> restored_keys;
+    std::vector<StorageObjectMetadata> restored_meta;
+    auto scan_res = backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) {
+            restored_keys.insert(restored_keys.end(), keys.begin(), keys.end());
+            restored_meta.insert(restored_meta.end(), metadatas.begin(),
+                                 metadatas.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_res.has_value());
+    ASSERT_EQ(restored_keys.size(), 1);
+    EXPECT_EQ(restored_keys.front(), "key_a");
+    ASSERT_EQ(restored_meta.size(), 1);
+    EXPECT_EQ(restored_meta.front().data_size, 7);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackendPersistsOwnerNodeId) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    DistributedKVBackendConfig dkv_config;
+    dkv_config.kv_endpoint = "mock://kv";
+    dkv_config.kv_namespace_ = "unit";
+
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    DistributedKVStorageBackend backend(config, dkv_config);
+    backend.SetKVClient(mock_client);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace("persistent_key", MakeSlices("persisted", buffers));
+    ASSERT_TRUE(backend
+                    .BatchOffload(batch,
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    const fs::path owner_file =
+        fs::path(data_path) / ".mooncake_owner_node_id";
+    ASSERT_TRUE(fs::exists(owner_file));
+
+    std::ifstream ifs(owner_file);
+    std::string persisted_owner_id;
+    ASSERT_TRUE(static_cast<bool>(std::getline(ifs, persisted_owner_id)));
+    ASSERT_FALSE(persisted_owner_id.empty());
+
+    DistributedKVBackendConfig reload_config = dkv_config;
+    DistributedKVStorageBackend reloaded_backend(config, reload_config);
+    reloaded_backend.SetKVClient(mock_client);
+    ASSERT_TRUE(reloaded_backend.Init().has_value());
+
+    std::vector<std::string> restored_keys;
+    ASSERT_TRUE(reloaded_backend
+                    .ScanMeta([&](const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>&) {
+                        restored_keys.insert(restored_keys.end(), keys.begin(),
+                                             keys.end());
+                        return ErrorCode::OK;
+                    })
+                    .has_value());
+    ASSERT_EQ(restored_keys.size(), 1);
+    EXPECT_EQ(restored_keys.front(), "persistent_key");
 }
 
 TEST_F(StorageBackendTest, BucketScan) {

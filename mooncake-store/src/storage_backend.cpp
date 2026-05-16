@@ -6,6 +6,8 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstring>
+#include <fstream>
+#include <cstdio>
 
 #include <regex>
 #include <string>
@@ -13,7 +15,11 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <random>
 #include <unordered_set>
+#include <cctype>
+#include <sstream>
 
 #include <ylt/struct_pb.hpp>
 
@@ -3196,6 +3202,509 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
 
 //-----------------------------------------------------------------------------
 
+bool DistributedKVBackendConfig::Validate() const {
+    if (kv_endpoint.empty()) {
+        LOG(ERROR) << "DistributedKVBackendConfig: kv_endpoint is empty";
+        return false;
+    }
+    if (kv_namespace_.empty()) {
+        LOG(ERROR) << "DistributedKVBackendConfig: kv_namespace is empty";
+        return false;
+    }
+    if (key_prefix.empty()) {
+        LOG(ERROR) << "DistributedKVBackendConfig: key_prefix is empty";
+        return false;
+    }
+    return true;
+}
+
+DistributedKVBackendConfig DistributedKVBackendConfig::FromEnvironment() {
+    DistributedKVBackendConfig config;
+    config.kv_endpoint =
+        GetEnvStringOr("MOONCAKE_DKV_ENDPOINT", config.kv_endpoint);
+    config.kv_namespace_ =
+        GetEnvStringOr("MOONCAKE_DKV_NAMESPACE", config.kv_namespace_);
+    config.owner_node_id =
+        GetEnvStringOr("MOONCAKE_DKV_OWNER_NODE_ID", config.owner_node_id);
+    config.key_prefix =
+        GetEnvStringOr("MOONCAKE_DKV_KEY_PREFIX", config.key_prefix);
+    config.kv_timeout_ms =
+        GetEnvOr<uint32_t>("MOONCAKE_DKV_TIMEOUT_MS", config.kv_timeout_ms);
+    return config;
+}
+
+namespace {
+
+DistributedKVClientFactory& GetDistributedKVClientFactory() {
+    static DistributedKVClientFactory factory;
+    return factory;
+}
+
+static constexpr const char* kOwnerNodeIdFileName =
+    ".mooncake_owner_node_id";
+
+bool IsValidUUID(const std::string& s) {
+    if (s.size() != 36) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (s[i] != '-') return false;
+        } else {
+            if (!std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
+        }
+    }
+    return true;
+}
+
+std::string TrimWhitespace(std::string value) {
+    const auto first = value.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const auto last = value.find_last_not_of(" \t\n\r");
+    return value.substr(first, last - first + 1);
+}
+
+std::string GenerateUUIDv4() {
+    std::random_device rd;
+    std::uniform_int_distribution<int> dist(0, 255);
+    std::array<unsigned char, 16> bytes{};
+    for (auto& byte : bytes) {
+        byte = static_cast<unsigned char>(dist(rd));
+    }
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0F) | 0x40);
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3F) | 0x80);
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        oss << std::setw(2) << static_cast<unsigned int>(bytes[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) {
+            oss << '-';
+        }
+    }
+    return oss.str();
+}
+
+}  // namespace
+
+void SetDistributedKVClientFactory(DistributedKVClientFactory factory) {
+    GetDistributedKVClientFactory() = std::move(factory);
+}
+
+DistributedKVStorageBackend::DistributedKVStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const DistributedKVBackendConfig& dkv_config)
+    : StorageBackendInterface(file_storage_config),
+      dkv_config_(dkv_config) {}
+
+std::string DistributedKVStorageBackend::MakeDataKey(
+    const std::string& key) const {
+    return dkv_config_.key_prefix + ":" + dkv_config_.kv_namespace_ +
+           ":data:" + key;
+}
+
+std::string DistributedKVStorageBackend::MakeMetaKey(
+    const std::string& key) const {
+    return dkv_config_.key_prefix + ":" + dkv_config_.kv_namespace_ +
+           ":meta:" + key;
+}
+
+std::string DistributedKVStorageBackend::EncodeMetaValue(
+    uint64_t size_bytes) const {
+    std::string result;
+    result.append(owner_node_id_);
+    result.push_back('|');
+    result.append(std::to_string(size_bytes));
+    return result;
+}
+
+tl::expected<std::pair<std::string, uint64_t>, ErrorCode>
+DistributedKVStorageBackend::DecodeMetaValue(
+    const std::string& meta_value) const {
+    auto sep = meta_value.find('|');
+    if (sep == std::string::npos) {
+        LOG(ERROR) << "Invalid meta value format: separator not found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::string owner_id = meta_value.substr(0, sep);
+    std::string size_str = meta_value.substr(sep + 1);
+    uint64_t size_bytes = 0;
+    try {
+        size_bytes = std::stoull(size_str);
+    } catch (...) {
+        LOG(ERROR) << "Invalid size in meta value: " << size_str;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return std::make_pair(std::move(owner_id), size_bytes);
+}
+
+std::string DistributedKVStorageBackend::InitializeOrLoadOwnerNodeId() {
+    if (!dkv_config_.owner_node_id.empty()) {
+        if (!IsValidUUID(dkv_config_.owner_node_id)) {
+            LOG(ERROR) << "Specified owner_node_id is not a valid UUID: "
+                       << dkv_config_.owner_node_id;
+            return "";
+        }
+        LOG(INFO) << "Using owner_node_id from config/env: "
+                  << dkv_config_.owner_node_id;
+        return dkv_config_.owner_node_id;
+    }
+
+    namespace fs = std::filesystem;
+    fs::path owner_file =
+        fs::path(file_storage_config_.storage_filepath) / kOwnerNodeIdFileName;
+
+    if (fs::exists(owner_file)) {
+        std::ifstream ifs(owner_file);
+        std::string stored_id;
+        if (ifs && std::getline(ifs, stored_id)) {
+            stored_id = TrimWhitespace(std::move(stored_id));
+            if (IsValidUUID(stored_id)) {
+                LOG(INFO) << "Loaded owner_node_id from file: " << stored_id;
+                return stored_id;
+            }
+            LOG(WARNING) << "Stored owner_node_id is invalid, regenerating";
+        }
+    }
+
+    std::string new_id = GenerateUUIDv4();
+    {
+        std::error_code ec;
+        fs::path dir = owner_file.parent_path();
+        if (!fs::exists(dir)) {
+            fs::create_directories(dir, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create directory for owner_node_id: "
+                           << dir << ", error: " << ec.message();
+                return new_id;
+            }
+        }
+        std::ofstream ofs(owner_file, std::ios::trunc);
+        if (ofs) {
+            ofs << new_id << "\n";
+            LOG(INFO) << "Generated and persisted new owner_node_id: " << new_id;
+        } else {
+            LOG(WARNING) << "Failed to persist owner_node_id to " << owner_file;
+        }
+    }
+    return new_id;
+}
+
+tl::expected<void, ErrorCode> DistributedKVStorageBackend::Init() {
+    if (initialized_.load(std::memory_order_acquire)) {
+        LOG(WARNING) << "DistributedKVStorageBackend already initialized";
+        return {};
+    }
+
+    owner_node_id_ = InitializeOrLoadOwnerNodeId();
+    if (owner_node_id_.empty()) {
+        LOG(ERROR) << "Failed to initialize owner_node_id";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    if (!kv_client_) {
+        LOG(ERROR) << "DistributedKVClient is not set. Call SetKVClient() "
+                      "before Init() or provide a factory.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto healthy = kv_client_->IsHealthy();
+    if (!healthy || !healthy.value()) {
+        LOG(ERROR) << "DistributedKV client is not healthy at endpoint: "
+                   << dkv_config_.kv_endpoint;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    total_keys_.store(0, std::memory_order_relaxed);
+    total_size_.store(0, std::memory_order_relaxed);
+
+    initialized_.store(true, std::memory_order_release);
+    LOG(INFO) << "DistributedKVStorageBackend initialized. owner_node_id="
+              << owner_node_id_
+              << ", kv_endpoint=" << dkv_config_.kv_endpoint
+              << ", kv_namespace=" << dkv_config_.kv_namespace_;
+    return {};
+}
+
+tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler,
+    std::function<void(const std::vector<std::string>& evicted_keys)>
+        eviction_handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DistributedKVStorageBackend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (batch_object.empty()) {
+        LOG(ERROR) << "BatchOffload called with empty batch";
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    auto enable_res = IsEnableOffloading();
+    if (!enable_res) return tl::make_unexpected(enable_res.error());
+    if (!enable_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    std::vector<std::string> data_keys;
+    std::vector<std::string> data_values;
+    std::vector<std::string> meta_keys;
+    std::vector<std::string> meta_values;
+    std::vector<std::string> succeeded_keys;
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<bool> existed_before;
+    std::vector<bool> succeeded_existed_before;
+
+    data_keys.reserve(batch_object.size());
+    data_values.reserve(batch_object.size());
+    meta_keys.reserve(batch_object.size());
+    meta_values.reserve(batch_object.size());
+    succeeded_existed_before.reserve(batch_object.size());
+
+    std::vector<std::string> exist_query_keys;
+    exist_query_keys.reserve(batch_object.size());
+
+    for (const auto& [key, slices] : batch_object) {
+        exist_query_keys.push_back(MakeDataKey(key));
+    }
+
+    auto exist_result = kv_client_->BatchExist(exist_query_keys);
+    if (!exist_result) {
+        LOG(ERROR) << "BatchExist failed before write: "
+                   << toString(exist_result.error());
+        return tl::make_unexpected(exist_result.error());
+    }
+    existed_before = std::move(exist_result.value());
+    if (existed_before.size() != exist_query_keys.size()) {
+        LOG(ERROR) << "BatchExist returned wrong number of results: expected "
+                   << exist_query_keys.size() << ", got "
+                   << existed_before.size();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    size_t existence_idx = 0;
+
+    for (const auto& [key, slices] : batch_object) {
+        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+            LOG(INFO) << "[TEST] Injecting failure for key: " << key;
+            ++existence_idx;
+            continue;
+        }
+
+        size_t total_size = 0;
+        for (const auto& s : slices) total_size += s.size;
+
+        std::string value;
+        value.reserve(total_size);
+        for (const auto& s : slices) {
+            value.append(reinterpret_cast<const char*>(s.ptr), s.size);
+        }
+
+        data_keys.push_back(MakeDataKey(key));
+        data_values.push_back(std::move(value));
+
+        meta_keys.push_back(MakeMetaKey(key));
+        meta_values.push_back(EncodeMetaValue(total_size));
+
+        succeeded_keys.push_back(key);
+        metadatas.emplace_back(StorageObjectMetadata{
+            -1, 0, static_cast<int64_t>(key.size()),
+            static_cast<int64_t>(total_size), ""});
+        succeeded_existed_before.push_back(existence_idx < existed_before.size()
+                                               ? existed_before[existence_idx]
+                                               : false);
+        ++existence_idx;
+    }
+
+    if (!data_keys.empty()) {
+        auto put_result = kv_client_->BatchPut(data_keys, data_values);
+        if (!put_result) {
+            LOG(ERROR) << "BatchPut data failed: " << toString(put_result.error());
+            return tl::make_unexpected(put_result.error());
+        }
+
+        auto meta_put_result = kv_client_->BatchPut(meta_keys, meta_values);
+        if (!meta_put_result) {
+            LOG(ERROR) << "BatchPut meta failed: "
+                       << toString(meta_put_result.error());
+            return tl::make_unexpected(meta_put_result.error());
+        }
+    }
+
+    for (size_t i = 0; i < succeeded_keys.size(); ++i) {
+        if (i >= succeeded_existed_before.size() || !succeeded_existed_before[i]) {
+            total_keys_.fetch_add(1, std::memory_order_relaxed);
+            total_size_.fetch_add(metadatas[i].data_size,
+                                  std::memory_order_relaxed);
+        }
+    }
+
+    if (complete_handler && !succeeded_keys.empty()) {
+        auto ec = complete_handler(succeeded_keys, metadatas);
+        if (ec != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << ec;
+            return tl::make_unexpected(ec);
+        }
+    }
+
+    if (eviction_handler) {
+        eviction_handler({});
+    }
+
+    return static_cast<int64_t>(succeeded_keys.size());
+}
+
+tl::expected<void, ErrorCode> DistributedKVStorageBackend::BatchLoad(
+    std::unordered_map<std::string, Slice>& batched_slices) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DistributedKVStorageBackend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<std::string> data_keys;
+    data_keys.reserve(batched_slices.size());
+    std::vector<std::string> original_keys;
+    original_keys.reserve(batched_slices.size());
+
+    for (const auto& [key, slice] : batched_slices) {
+        data_keys.push_back(MakeDataKey(key));
+        original_keys.push_back(key);
+    }
+
+    auto get_result = kv_client_->BatchGet(data_keys);
+    if (!get_result) {
+        LOG(ERROR) << "BatchGet failed: " << toString(get_result.error());
+        return tl::make_unexpected(get_result.error());
+    }
+
+    const auto& values = get_result.value();
+    if (values.size() != batched_slices.size()) {
+        LOG(ERROR) << "BatchGet returned wrong number of results: expected "
+                   << batched_slices.size() << ", got " << values.size();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    for (size_t idx = 0; idx < original_keys.size(); ++idx) {
+        const auto& key = original_keys[idx];
+        auto slice_it = batched_slices.find(key);
+        if (slice_it == batched_slices.end()) {
+            LOG(ERROR) << "Requested key missing from batch slice map: " << key;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        auto& slice = slice_it->second;
+        const auto& value = values[idx];
+        if (value.size() != slice.size) {
+            LOG(ERROR) << "Size mismatch for key '" << key
+                       << "': expected " << slice.size
+                       << ", got " << value.size();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        std::memcpy(slice.ptr, value.data(), value.size());
+    }
+
+    return {};
+}
+
+tl::expected<bool, ErrorCode> DistributedKVStorageBackend::IsExist(
+    const std::string& key) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DistributedKVStorageBackend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = kv_client_->BatchExist({MakeDataKey(key)});
+    if (!result) return tl::make_unexpected(result.error());
+    if (result->empty()) return false;
+    return result->front();
+}
+
+tl::expected<bool, ErrorCode>
+DistributedKVStorageBackend::IsEnableOffloading() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DistributedKVStorageBackend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto healthy = kv_client_->IsHealthy();
+    if (!healthy) return tl::make_unexpected(healthy.error());
+    if (!healthy.value()) return false;
+
+    if (total_keys_.load(std::memory_order_relaxed) >
+            file_storage_config_.total_keys_limit ||
+        total_size_.load(std::memory_order_relaxed) >
+            file_storage_config_.total_size_limit) {
+        return false;
+    }
+
+    return true;
+}
+
+tl::expected<void, ErrorCode> DistributedKVStorageBackend::ScanMeta(
+    const std::function<ErrorCode(
+        const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DistributedKVStorageBackend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto list_result = kv_client_->ListKeysByOwner(owner_node_id_);
+    if (!list_result) {
+        LOG(ERROR) << "ListKeysByOwner failed: "
+                   << toString(list_result.error());
+        return tl::make_unexpected(list_result.error());
+    }
+
+    const auto& owner_keys = list_result.value();
+    if (owner_keys.empty()) {
+        LOG(INFO) << "ScanMeta: no keys found for owner_node_id="
+                  << owner_node_id_;
+        return {};
+    }
+
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metas;
+    keys.reserve(file_storage_config_.scanmeta_iterator_keys_limit);
+    metas.reserve(file_storage_config_.scanmeta_iterator_keys_limit);
+
+    int64_t restored_keys = 0;
+    int64_t restored_size = 0;
+
+    for (const auto& [key, size_bytes] : owner_keys) {
+        keys.push_back(key);
+        metas.emplace_back(StorageObjectMetadata{
+            -1, 0, static_cast<int64_t>(key.size()),
+            static_cast<int64_t>(size_bytes), ""});
+
+        restored_keys++;
+        restored_size += static_cast<int64_t>(size_bytes);
+
+        if (static_cast<int64_t>(keys.size()) >=
+            file_storage_config_.scanmeta_iterator_keys_limit) {
+            auto ec = handler(keys, metas);
+            if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
+            keys.clear();
+            metas.clear();
+        }
+    }
+
+    if (!keys.empty()) {
+        auto ec = handler(keys, metas);
+        if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
+    }
+
+    total_keys_.store(restored_keys, std::memory_order_relaxed);
+    total_size_.store(restored_size, std::memory_order_relaxed);
+
+    LOG(INFO) << "ScanMeta complete: restored " << restored_keys
+              << " keys (" << restored_size << " bytes) for owner_node_id="
+              << owner_node_id_;
+    return {};
+}
+
+//-----------------------------------------------------------------------------
+
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
@@ -3220,6 +3729,20 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kOffsetAllocator: {
             return std::make_shared<OffsetAllocatorStorageBackend>(config);
+        }
+        case StorageBackendType::kDistributedKV: {
+            auto dkv_config = DistributedKVBackendConfig::FromEnvironment();
+            if (!dkv_config.Validate()) {
+                throw std::invalid_argument(
+                    "Invalid DistributedKV backend configuration");
+            }
+            auto backend =
+                std::make_shared<DistributedKVStorageBackend>(config, dkv_config);
+            auto& factory = GetDistributedKVClientFactory();
+            if (factory) {
+                backend->SetKVClient(factory(dkv_config));
+            }
+            return backend;
         }
         default: {
             LOG(FATAL) << "Unsupported backend type";

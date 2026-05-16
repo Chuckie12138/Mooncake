@@ -3,12 +3,16 @@
 #include <glog/logging.h>
 
 #include <atomic>
+#include <array>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "file_interface.h"
@@ -155,7 +159,7 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
-enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
+enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator, kDistributedKV };
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
@@ -193,6 +197,18 @@ struct BucketBackendConfig {
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
+};
+
+struct DistributedKVBackendConfig {
+    std::string kv_endpoint;
+    std::string kv_namespace_ = "default";
+    std::string owner_node_id;
+    std::string key_prefix = "mooncake";
+    uint32_t kv_timeout_ms = 5000;
+
+    bool Validate() const;
+
+    static DistributedKVBackendConfig FromEnvironment();
 };
 
 struct FileStorageConfig {
@@ -1217,6 +1233,91 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
+};
+
+class DistributedKVClient {
+   public:
+    virtual ~DistributedKVClient() = default;
+
+    virtual tl::expected<void, ErrorCode> BatchPut(
+        const std::vector<std::string>& keys,
+        const std::vector<std::string>& values) = 0;
+
+    virtual tl::expected<std::vector<std::string>, ErrorCode> BatchGet(
+        const std::vector<std::string>& keys) = 0;
+
+    virtual tl::expected<std::vector<bool>, ErrorCode> BatchExist(
+        const std::vector<std::string>& keys) = 0;
+
+    virtual tl::expected<std::vector<std::pair<std::string, uint64_t>>,
+                         ErrorCode>
+    ListKeysByOwner(const std::string& owner_node_id) = 0;
+
+    virtual tl::expected<bool, ErrorCode> IsHealthy() = 0;
+};
+
+using DistributedKVClientFactory =
+    std::function<std::shared_ptr<DistributedKVClient>(
+        const DistributedKVBackendConfig& config)>;
+
+void SetDistributedKVClientFactory(DistributedKVClientFactory factory);
+
+class DistributedKVStorageBackend : public StorageBackendInterface {
+   public:
+    DistributedKVStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedKVBackendConfig& dkv_config);
+
+    tl::expected<void, ErrorCode> Init() override;
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler,
+        std::function<void(const std::vector<std::string>& evicted_keys)>
+            eviction_handler = nullptr) override;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
+    void SetKVClient(std::shared_ptr<DistributedKVClient> client) {
+        kv_client_ = std::move(client);
+    }
+
+   private:
+    std::string MakeDataKey(const std::string& key) const;
+    std::string MakeMetaKey(const std::string& key) const;
+    std::string EncodeMetaValue(uint64_t size_bytes) const;
+    tl::expected<std::pair<std::string, uint64_t>, ErrorCode> DecodeMetaValue(
+        const std::string& meta_value) const;
+
+    std::string InitializeOrLoadOwnerNodeId();
+
+    const DistributedKVBackendConfig dkv_config_;
+    std::string owner_node_id_;
+
+    std::shared_ptr<DistributedKVClient> kv_client_;
+
+    std::atomic<bool> initialized_{false};
+    std::atomic<int64_t> total_keys_{0};
+    std::atomic<int64_t> total_size_{0};
+
     std::function<bool(const std::string& key)> test_failure_predicate_;
 };
 
